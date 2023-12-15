@@ -1,8 +1,25 @@
 <?php
 namespace Nats;
 
+use Nats\Logger\EchoLogger;
+use Nats\Message\MessageInterface;
+use Nats\Parser\NatsParser;
+use Psr\Log\LoggerInterface;
 use RandomLib\Factory;
 use RandomLib\Generator;
+use React\EventLoop\Loop;
+use React\EventLoop\LoopInterface;
+use React\EventLoop\TimerInterface;
+use React\Promise\Deferred;
+use React\Promise\Promise;
+use React\Promise\PromiseInterface;
+use React\Stream\DuplexResourceStream;
+use React\Stream\DuplexStreamInterface;
+use React\Stream\ReadableResourceStream;
+use React\Stream\ReadableStreamInterface;
+use React\Stream\ThroughStream;
+use React\Stream\WritableResourceStream;
+use React\Stream\WritableStreamInterface;
 
 /**
  * Connection Class.
@@ -13,137 +30,50 @@ use RandomLib\Generator;
  */
 class Connection
 {
-
-    /**
-     * Show DEBUG info?
-     *
-     * @var boolean $debug If debug is enabled.
-     */
-    private $debug = false;
-
-
-    /**
-     * Enable or disable debug mode.
-     *
-     * @param boolean $debug If debug is enabled.
-     *
-     * @return void
-     */
-    public function setDebug($debug)
-    {
-        $this->debug = $debug;
-    }
-
-    /**
-     * Number of PINGs.
-     *
-     * @var integer number of pings.
-     */
-    private $pings = 0;
-
-
-    /**
-     * Return the number of pings.
-     *
-     * @return integer Number of pings
-     */
-    public function pingsCount()
-    {
-        return $this->pings;
-    }
-
-    /**
-     * Chunk size in bytes to use when reading an stream of data.
-     *
-     * @var integer size of chunk.
-     */
-    private $chunkSize = 1500;
-
-    /**
-     * Number of messages published.
-     *
-     * @var int number of messages
-     */
-    private $pubs = 0;
-
-
-    /**
-     * Return the number of messages published.
-     *
-     * @return integer number of messages published
-     */
-    public function pubsCount()
-    {
-        return $this->pubs;
-    }
-
-    /**
-     * Number of reconnects to the server.
-     *
-     * @var int Number of reconnects
-     */
-    private $reconnects = 0;
-
-
-    /**
-     * Return the number of reconnects to the server.
-     *
-     * @return integer number of reconnects
-     */
-    public function reconnectsCount()
-    {
-        return $this->reconnects;
-    }
+    private bool $isHandshakeDone = false;
+    private ReadableStreamInterface $reader;
+    private WritableStreamInterface $writer;
+    private Handshake $handshake;
+    private LoopInterface $loop;
 
     /**
      * List of available subscriptions.
      *
      * @var array list of subscriptions
      */
-    private $subscriptions = [];
-
-
-    /**
-     * Return the number of subscriptions available.
-     *
-     * @return integer number of subscription
-     */
-    public function subscriptionsCount()
-    {
-        return count($this->subscriptions);
-    }
-
-
-    /**
-     * Return subscriptions list.
-     *
-     * @return array list of subscription ids
-     */
-    public function getSubscriptions()
-    {
-        return array_keys($this->subscriptions);
-    }
+    private array $subscriptions = [];
 
     /**
      * Connection options object.
      *
      * @var ConnectionOptions|null
      */
-    private $options = null;
+    private ?ConnectionOptions $options = null;
+    private ?LoggerInterface $logger;
+
+    /**
+     * @return ConnectionOptions|null
+     */
+    public function getOptions(): ?ConnectionOptions
+    {
+        return $this->options;
+    }
 
     /**
      * Connection timeout
      *
      * @var float
      */
-    private $timeout = null;
+    private ?float $timeout = null;
 
     /**
      * Stream File Pointer.
      *
      * @var mixed Socket file pointer
      */
-    private $streamSocket;
+    private mixed $streamSocket;
+
+    private Deferred $onConnected;
 
     /**
      * Generator object.
@@ -152,18 +82,8 @@ class Connection
      */
     private $randomGenerator;
 
+    private NatsParser $parser;
 
-    /**
-     * Sets the chunck size in bytes to be processed when reading.
-     *
-     * @param integer $chunkSize Set byte chunk len to read when reading from wire.
-     *
-     * @return void
-     */
-    public function setChunkSize($chunkSize)
-    {
-        $this->chunkSize = $chunkSize;
-    }
 
     /**
      * Set Stream Timeout.
@@ -201,19 +121,6 @@ class Connection
     }
 
     /**
-     * Indicates whether $response is an error response.
-     *
-     * @param string $response The Nats Server response.
-     *
-     * @return boolean
-     */
-    private function isErrorResponse($response)
-    {
-        return substr($response, 0, 4) === '-ERR';
-    }
-
-
-    /**
      * Checks if the client is connected to a server.
      *
      * @return boolean
@@ -237,15 +144,7 @@ class Connection
         $errno  = null;
         $errstr = null;
 
-        set_error_handler(
-            function () {
-                return true;
-            }
-        );
-
         $fp = stream_socket_client($address, $errno, $errstr, $timeout, STREAM_CLIENT_CONNECT, $context);
-        restore_error_handler();
-
         if ($fp === false) {
             throw Exception::forStreamSocketClientError($errstr, $errno);
         }
@@ -255,48 +154,20 @@ class Connection
         $microseconds = (($timeout - $seconds) * 1000);
         stream_set_timeout($fp, $seconds, $microseconds);
 
+        $this->reader = new ReadableResourceStream($fp, $this->loop);
+        $this->writer = new ThroughStream();
+
         return $fp;
     }
 
-    /**
-     * Server information.
-     *
-     * @var mixed
-     */
-    private $serverInfo;
-
-
-    /**
-     * Process information returned by the server after connection.
-     *
-     * @param string $connectionResponse INFO message.
-     *
-     * @return void
-     */
-    private function processServerInfo($connectionResponse)
-    {
-        $this->serverInfo = new ServerInfo($connectionResponse);
-    }
-
-    /**
-     * Returns current connected server ID.
-     *
-     * @return string Server ID.
-     */
-    public function connectedServerID()
-    {
-        return $this->serverInfo->getServerID();
-    }
 
     /**
      * Constructor.
      *
-     * @param ConnectionOptions $options Connection options object.
+     * @param ConnectionOptions|null $options Connection options object.
      */
-    public function __construct(ConnectionOptions $options = null)
+    public function __construct(ConnectionOptions $options = null, ?LoggerInterface $logger = null, ?LoopInterface $loop = null)
     {
-        $this->pings         = 0;
-        $this->pubs          = 0;
         $this->subscriptions = [];
         $this->options       = $options;
         if (version_compare(phpversion(), '7.0', '>') === true) {
@@ -309,6 +180,28 @@ class Connection
         if ($options === null) {
             $this->options = new ConnectionOptions();
         }
+
+        if(null === $loop) {
+            $loop = Loop::get();
+        }
+
+        $this->loop = $loop;
+
+        if(!$logger instanceof LoggerInterface) {
+            $logger = new EchoLogger($this->loop, []);
+        }
+        $this->logger = $logger;
+
+    }
+
+    public function getLogger(): LoggerInterface
+    {
+        return $this->logger;
+    }
+
+    public function setLogger(LoggerInterface $logger): void
+    {
+        $this->logger = $logger;
     }
 
     /**
@@ -319,65 +212,24 @@ class Connection
      * @throws \Exception Raises if fails sending data.
      * @return void
      */
-    private function send($payload)
+    public function send(string $payload): void
     {
-        $msg = $payload."\r\n";
-        $len = strlen($msg);
-        while (true) {
-            $written = @fwrite($this->streamSocket, $msg);
-            if ($written === false) {
-                throw new \Exception('Error sending data');
-            }
-
-            if ($written === 0) {
-                throw new \Exception('Broken pipe or closed connection');
-            }
-
-            $len = ($len - $written);
-            if ($len > 0) {
-                $msg = substr($msg, (0 - $len));
-            } else {
-                break;
-            }
+        //$this->stream->write($payload);
+        if(!str_ends_with($payload, "\r\n")) {
+            $payload = $payload."\r\n";
         }
-
-        if ($this->debug === true) {
-            printf('>>>> %s', $msg);
-        }
+        $this->logger->debug(sprintf("Sending : %s", $payload));
+        $this->writer->write($payload);
     }
 
-    /**
-     * Receives a message thought the stream.
-     *
-     * @param integer $len Number of bytes to receive.
-     *
-     * @return string
-     */
-    private function receive($len = 0)
+    public function getParser(): NatsParser
     {
-        if ($len > 0) {
-            $chunkSize     = $this->chunkSize;
-            $line          = null;
-            $receivedBytes = 0;
-            while ($receivedBytes < $len) {
-                $bytesLeft = ($len - $receivedBytes);
-                if ($bytesLeft < $this->chunkSize) {
-                    $chunkSize = $bytesLeft;
-                }
+        return $this->parser;
+    }
 
-                $readChunk      = fread($this->streamSocket, $chunkSize);
-                $receivedBytes += strlen($readChunk);
-                $line          .= $readChunk;
-            }
-        } else {
-            $line = fgets($this->streamSocket);
-        }
-
-        if ($this->debug === true) {
-            printf('<<<< %s\r\n', $line);
-        }
-
-        return $line;
+    public function setParser(NatsParser $parser): void
+    {
+        $this->parser = $parser;
     }
 
     /**
@@ -399,33 +251,18 @@ class Connection
      * @return             void
      * @codeCoverageIgnore
      */
-    private function handleMSG($line)
+    private function handleMSG(MessageInterface $message)
     {
-        $parts   = explode(' ', $line);
-        $subject = null;
-        $length  = trim($parts[3]);
-        $sid     = $parts[2];
-
-        if (count($parts) === 5) {
-            $length  = trim($parts[4]);
-            $subject = $parts[3];
-        } elseif (count($parts) === 4) {
-            $length  = trim($parts[3]);
-            $subject = $parts[1];
+        if (isset($this->subscriptions[$message->getSid()]) === false) {
+            throw Exception::forSubscriptionNotFound($message->getSid());
         }
 
-        $payload = $this->receive($length);
-        $msg     = new Message($subject, $payload, $sid, $this);
-
-        if (isset($this->subscriptions[$sid]) === false) {
-            throw Exception::forSubscriptionNotFound($sid);
-        }
-
-        $func = $this->subscriptions[$sid];
+        $this->logger->info(sprintf("Handling message from %s (%s)", $message->getSubject(), $message->getSid()));
+        $func = $this->subscriptions[$message->getSid()];
         if (is_callable($func) === true) {
-            $func($msg);
+            $func($message, $this);
         } else {
-            throw Exception::forSubscriptionCallbackInvalid($sid);
+            throw Exception::forSubscriptionCallbackInvalid($message->getSid());
         }
     }
 
@@ -437,47 +274,79 @@ class Connection
      * @throws \Exception Exception raised if connection fails.
      * @return void
      */
-    public function connect($timeout = null)
+    public function connect($timeout = null): PromiseInterface
     {
         if ($timeout === null) {
             $timeout = intval(ini_get('default_socket_timeout'));
         }
 
+        $this->isHandshakeDone = false;
+
+        $this->onConnected = new Deferred();
+        $this->handshake = new Handshake($this);
+        $this->parser = new NatsParser();
+
+        $this->handshake->doHandshake()->then(function() {
+            $this->isHandshakeDone = true;
+            $this->logger->info("Handshake done");
+            $this->onConnected->resolve($this);
+        })->catch(function(\Exception $error) {
+            $this->logger->error(sprintf('Handshake failed, received : %s', $error->getMessage()));
+            $this->onConnected->reject($error);
+        });
+
+        $this->logger->info(sprintf("Connecting to %s", $this->options->getAddress()));
         $this->timeout      = $timeout;
         $this->streamSocket = $this->getStream(
-            $this->options->getAddress(), $timeout, $this->options->getStreamContext());
+            $this->options->getAddress(), $timeout, $this->options->getStreamContext(), );
         $this->setStreamTimeout($timeout);
 
-        $infoResponse = $this->receive();
+        $writer = new BufferedWriter($this->loop, $this->streamSocket);
 
-        if ($this->isErrorResponse($infoResponse) === true) {
-            throw Exception::forFailedConnection($infoResponse);
-        } else {
-            $this->processServerInfo($infoResponse);
-            if ($this->serverInfo->isTLSRequired()) {
-                set_error_handler(
-                    function ($errno, $errstr, $errfile, $errline) {
-                        restore_error_handler();
-                        throw Exception::forFailedConnection($errstr);
-                    });
+        $this->writer->on("data", function($payload) use($writer) {
+            $writer->write($payload);
+        });
 
-                if (!stream_socket_enable_crypto(
-                        $this->streamSocket, true, STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT)) {
-                    throw Exception::forFailedConnection('Error negotiating crypto');
-                }
-
-                restore_error_handler();
+        $this->reader->on("data", function($line) {
+            $debugText = substr($line, 0, 80);
+            if(strlen($line > 80)) {
+                $debugText .= '...'.substr($line, -10);
             }
-        }
+            $this->logger->debug(sprintf("Received : %s", $debugText));
 
-        $msg = 'CONNECT '.$this->options;
-        $this->send($msg);
-        $this->ping();
-        $pingResponse = $this->receive();
+            if ($line === false) {
+                return null;
+            }
 
-        if ($this->isErrorResponse($pingResponse) === true) {
-            throw Exception::forFailedPing($pingResponse);
-        }
+            $this->parser->parse($line, $this)
+                ->then(function($result) {
+                    $type = $result['type'];
+                    $parsed = $result['parsed'];
+
+                    switch($type) {
+                        case 'unknown':
+                            if(!$this->isHandshakeDone) {
+                                $this->handshake->handle($parsed);
+                            }
+                            break;
+                        case 'msg':
+                            $this->handleMSG($parsed);
+                            break;
+                        case 'ping':
+                            $this->handlePING();
+                            break;
+                    }
+
+                })->catch(function(\Exception $exception) {
+                    $this->logger->error($exception->getMessage());
+                });
+            $info = stream_get_meta_data($this->streamSocket);
+            if ($info['timed_out'] === true) {
+                $this->close();
+            }
+        });
+
+        return $this->onConnected->promise();
     }
 
     /**
@@ -487,9 +356,7 @@ class Connection
      */
     public function ping()
     {
-        $msg = 'PING';
-        $this->send($msg);
-        $this->pings += 1;
+        $this->send('PING');
     }
 
     /**
@@ -499,18 +366,21 @@ class Connection
      * @param string   $payload  Message data.
      * @param \Closure $callback Closure to be executed as callback.
      *
-     * @return void
      */
-    public function request($subject, $payload, \Closure $callback)
+    public function request(MessageInterface $message): PromiseInterface
     {
-        $inbox = uniqid('_INBOX.');
-        $sid   = $this->subscribe(
-            $inbox,
-            $callback
-        );
-        $this->unsubscribe($sid, 1);
-        $this->publish($subject, $payload, $inbox);
-        $this->wait(1);
+        return new Promise(function(callable $resolver) use($message) {
+            $inbox = uniqid('_INBOX.');
+            $this->subscribe(
+                $inbox,
+                function(MessageInterface $message) use($resolver) {
+                    $this->unsubscribe($message->getSid(), 1);
+                    $resolver($message, $this);
+                }
+            );
+
+            $this->publish($message, $inbox);
+        });
     }
 
     /**
@@ -524,6 +394,7 @@ class Connection
     public function subscribe($subject, \Closure $callback)
     {
         $sid = $this->randomGenerator->generateString(16);
+        $this->logger->info(sprintf('Subscribing to %s (%s)', $subject, $sid));
         $msg = 'SUB '.$subject.' '.$sid;
         $this->send($msg);
         $this->subscriptions[$sid] = $callback;
@@ -542,6 +413,7 @@ class Connection
     public function queueSubscribe($subject, $queue, \Closure $callback)
     {
         $sid = $this->randomGenerator->generateString(16);
+        $this->logger->info(sprintf('Subscribing to %s in queue %s (%s)', $subject, $queue, $sid));
         $msg = 'SUB '.$subject.' '.$queue.' '.$sid;
         $this->send($msg);
         $this->subscriptions[$sid] = $callback;
@@ -558,6 +430,7 @@ class Connection
      */
     public function unsubscribe($sid, $quantity = null)
     {
+        $this->logger->info(sprintf('Unsubscribing from %s', $sid));
         $msg = 'UNSUB '.$sid;
         if ($quantity !== null) {
             $msg = $msg.' '.$quantity;
@@ -580,54 +453,18 @@ class Connection
      * @return void
      *
      */
-    public function publish($subject, $payload = null, $inbox = null)
+    public function publish(MessageInterface $message, $inbox = null)
     {
-        $msg = 'PUB '.$subject;
+        $this->logger->info(sprintf('Publishing to %s', $message->getSubject()));
+        $msg = 'PUB '.$message->getSubject();
         if ($inbox !== null) {
             $msg = $msg.' '.$inbox;
         }
 
+        $payload = sprintf('%s:!:%s', $message->getType(), $message->serialize());
+
         $msg = $msg.' '.strlen($payload);
         $this->send($msg."\r\n".$payload);
-        $this->pubs += 1;
-    }
-
-    /**
-     * Waits for messages.
-     *
-     * @param integer $quantity Number of messages to wait for.
-     *
-     * @return Connection $connection Connection object
-     */
-    public function wait($quantity = 0)
-    {
-        $count = 0;
-        $info  = stream_get_meta_data($this->streamSocket);
-        while (is_resource($this->streamSocket) === true && feof($this->streamSocket) === false && empty($info['timed_out']) === true) {
-            $line = $this->receive();
-
-            if ($line === false) {
-                return null;
-            }
-
-            if (strpos($line, 'PING') === 0) {
-                $this->handlePING();
-            }
-
-            if (strpos($line, 'MSG') === 0) {
-                $count++;
-                $this->handleMSG($line);
-                if (($quantity !== 0) && ($count >= $quantity)) {
-                    return $this;
-                }
-            }
-
-            $info = stream_get_meta_data($this->streamSocket);
-        }
-
-        $this->close();
-
-        return $this;
     }
 
     /**
@@ -637,7 +474,7 @@ class Connection
      */
     public function reconnect()
     {
-        $this->reconnects += 1;
+        $this->logger->warning('Reconnecting');
         $this->close();
         $this->connect($this->timeout);
     }
@@ -649,11 +486,15 @@ class Connection
      */
     public function close()
     {
+        $this->logger->info('Closing');
         if ($this->streamSocket === null) {
             return;
         }
 
-        fclose($this->streamSocket);
+        $this->reader->close();
+        $this->writer->close();
+        unset($this->buffer);
+
         $this->streamSocket = null;
     }
 }

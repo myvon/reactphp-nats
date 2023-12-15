@@ -1,194 +1,166 @@
-phpnats
+myvon/reactphp-nats
 =======
 
-**Travis**
-
-| Master  | Develop |
-| ------------- | ------------- |
-| [![Build Status](https://travis-ci.org/repejota/phpnats.png?branch=master)](https://travis-ci.org/repejota/phpnats)  | [![Build Status](https://travis-ci.org/repejota/phpnats.png?branch=develop)](https://travis-ci.org/repejota/phpnats)  |
-
-**Coverage**
-
-| Master  | Develop |
-| ------------- | ------------- |
-| [![Coverage Status](https://coveralls.io/repos/repejota/phpnats/badge.svg?branch=master)](https://coveralls.io/r/repejota/phpnats?branch=master) | [![Coverage Status](https://coveralls.io/repos/repejota/phpnats/badge.svg?branch=develop)](https://coveralls.io/r/repejota/phpnats?branch=develop)  |
 
 Introduction
 ------------
 
-A PHP client for the [NATS messaging system](https://nats.io).
+A PHP client for the [NATS messaging system](https://nats.io) with [ReactPHP](https://reactphp.org/). 
+This library is made from [Repejota's PHPNATS](https://github.com/repejota/phpnats) with a lot of modification.
 
 Requirements
 ------------
 
-* php 5.6+
-* [gnatsd](https://github.com/apcera/gnatsd)
-
+* php 8.0+
+* [nats-server](https://github.com/nats-io/nats-server)
+* [ReactPHP EventLoop](https://reactphp.org/event-loop/)
+* [ReactPHP Stream](https://reactphp.org/stream/)
+* [ReactPHP Promise](https://reactphp.org/promise/)
+* [PSR3 LoggerInterface](https://packagist.org/packages/psr/log)
 
 Usage
 -----
 
 ### Installation
 
-Let's start by downloading composer into our project dir:
-```
-curl -O http://getcomposer.org/composer.phar
-chmod +x composer.phar
-```
-
-Now let's tell composer about our project's dependancies, in this case, PHPNats. The way we do this is by creating a composer.json file, and placing it in the root folder of our project, right next to composer.phar
-
-```
-{
-  "require": {
-    "repejota/nats": "dev-master"
-  }
-}
-```
-Let's let Composer work its magic:
-```
-php composer.phar install
-```
-Composer will download all the dependencies defined in composer.json, and prepare all the files needed to autoload them.
-
+Work In Progress
 
 ### Basic Usage
 
+Start by initializing the connection :
 ```php
 $client = new \Nats\Connection();
-$client->connect();
-
-// Publish Subscribe
-
-// Simple Subscriber.
-$client->subscribe(
-    'foo',
-    function ($message) {
-        printf("Data: %s\r\n", $message->getBody());
-    }
-);
-
-// Simple Publisher.
-$client->publish('foo', 'Marty McFly');
-
-// Wait for 1 message.
-$client->wait(1);
-
-// Request Response
-
-// Responding to requests.
-$sid = $client->subscribe(
-    'sayhello',
-    function ($message) {
-        $message->reply('Reply: Hello, '.$message->getBody().' !!!');
-    }
-);
-
-// Request.
-$client->request(
-    'sayhello',
-    'Marty McFly',
-    function ($message) {
-        echo $message->getBody();
-    }
-);
+$client->connect()->then(function(\Nats\Connection $connection) {
+    // Connected and handshake is done
+});
 ```
+
+
+Subscribe to a subject :
+```php
+$connection->subscribe("mySubject", function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+    $content = $message->getBody();
+});
+```
+
+Subscribe to a subject in queue (see [Queue Groups](https://docs.nats.io/nats-concepts/core-nats/queue) for more information):
+```php
+$connection->queueSubscribe("mySubject", "myQueue", function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+    $content = $message->getBody();
+});
+```
+
+Publish to a subject :
+```php
+$connection->publish(new \Nats\Message\PlainMessage("my message", "mySubject"));
+```
+
+Make a [request](https://docs.nats.io/nats-concepts/core-nats/reqreply/reqreply_walkthrough)  :
+```php
+    $connection->request(new \Nats\Message\PlainMessage("my message", "mySubject"))
+    ->then(function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+        $response = $message->getBody();
+    });
+```
+
+Respond to a [request](https://docs.nats.io/nats-concepts/core-nats/reqreply/reqreply_walkthrough)  :
+```php
+    $connection->subscribe("mySubject", function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+        $connection->publish($message->respond(new \Nats\Message\PlainMessage("Hello !")));
+    });
+
+
+    $connection->queueSubscribe("mySubject", "myQueue", function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+        $connection->publish($message->respond(new \Nats\Message\PlainMessage("Hello !")));
+    });
+```
+
+### Structured data
+
+For now only plain text and array are supported through `\Nats\Message\PlainMessage` and `\Nats\Message\ArrayMessage`, both implementing `\Nats\Message\MessageInterface`.
+Content can be accessed via the `getBody()` method.
+
+Example: 
+```php
+    $connection->subscribe("mySubject", function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+        if($message instanceof \Nats\Message\ArrayMessage) {
+            $array =  $message->getBody();
+            $name = $array['name'];
+        } else {
+            $name = $message->getBody();
+        }
+        $connection->publish($message->respond(new \Nats\Message\PlainMessage(sprintf('Hello %s', $name))))
+    });
+
+    $connection->request(new \Nats\Message\PlainMessage("morgan", "hello.world"))
+        ->then(function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+            $response = $message->getBody(); // Hello Morgan
+        });
+
+    $connection->request(new \Nats\Message\ArrayMessage(['name' => 'Morgan'], "hello.world"))
+    ->then(function(\Nats\Message\MessageInterface $message, \Nats\Connection $connection) {
+        $response = $message->getBody(); // Hello Morgan
+    });
+```
+
+### ReactPHP Loop
+
+By default the library retreive the ReactPHP loop by calling `Loop::get()`. You can pass the loop to utilize as third argument of the constructor off `\Nats\Connection`
+
+```php
+$loop = /* your loop */;
+
+$client = new \Nats\Connection(null, null, $loop);
+$client->connect()->then(function(\Nats\Connection $connection) {
+    // Connected and handshake is done
+});
+```
+
+Closing the connection with the `close()` method will also close all stream.
+
+### Logging
+
+You can see what's happening in the hood by passing an object implentin the psr3 `\Psr\Log\LoggerInterface` interface through 2nd arguments of the connection : 
+
+```php
+$client = new \Nats\Connection(null, new \Nats\Logger\EchoLogger());
+```
+
+The `\Nats\Logger\EchoLogger` will simply echo every log passed if the format `[level][H:i:s] log text`. 
 
 ### Encoded Connections
 
-```php
-$encoder = new \Nats\Encoders\JSONEncoder();
-$options = new \Nats\ConnectionOptions();
-$client = new \Nats\EncodedConnection($options, $encoder);
-$client->connect();
+Work In Progress
 
-// Publish Subscribe
 
-// Simple Subscriber.
-$client->subscribe(
-    'foo',
-    function ($payload) {
-        printf("Data: %s\r\n", $payload->getBody()[1]);
-    }
-);
+### TODO
 
-// Simple Publisher.
-$client->publish(
-    'foo',
-    [
-     'Marty',
-     'McFly',
-    ]
-);
-
-// Wait for 1 message.
-$client->wait(1);
-
-// Request Response
-
-// Responding to requests.
-$sid = $client->subscribe(
-    'sayhello',
-    function ($message) {
-        $message->reply('Reply: Hello, '.$message->getBody()[1].' !!!');
-    }
-);
-
-// Request.
-$client->request(
-    'sayhello',
-    [
-     'Marty',
-     'McFly',
-    ],
-    function ($message) {
-        echo $message->getBody();
-    }
-);
-```
-
+- Finish refactoring of the code. 
+- Reduce the number of lines in the `connect()` by splitting the logic
+- Make code more easily readable (by adding comments for exemple ...)
+- Add unit tests !!!
+- Ensure code quality
 
 Developer's Information
 -----------------------
 
 ### Releases
 
-* [Latest stable](https://github.com/repejota/phpnats/tree/master)
-* [Latest dev](https://github.com/repejota/phpnats/tree/develop)
-
-* [PHPNats on Packagist](https://packagist.org/packages/repejota/nats)
+Work In Progress 
 
 ### Tests
 
-Tests are in the `tests` folder.
-To run them, you need `PHPUnit` and execute `make test-tdd`.
 
-We also have a BDD test suite under the `spec` folder.
-To run the suite, you need `PHPSpec` and execute `make test-bdd`.
-
-You can also execute the all suites ( TDD + BDD ) with `make test`.
+Work In Progress
 
 ### Code Quality
 
-We are using [PHP Code Sniffer](http://pear.php.net/package/PHP_CodeSniffer/docs)
-to ensure our code follow an high quality standard.
+Work In Progress
 
-To perform an analysis of the code execute `make lint`.
-
-There is currently three steps when we lint our code:
-
-* First we lint with php itself `php -l`
-* Then we lint with PSR2 standard
-* And finally we lint with a custom [ruleset.xml](https://github.com/repejota/phpnats/blob/feature/lint-squiz/ruleset.xml) that checks dockblocks and different performance tips.
-
-
-Creators
+Credits
 --------
 
-**Raül Pérez**
-
-- <https://twitter.com/repejota>
-- <https://github.com/repejota>
+- Thanks to [Raül Pérez](https://github.com/repejota) for the original [phpnats](https://github.com/repejota/phpnats) library and all of it's [contributors](https://github.com/repejota/phpnats/blob/develop/CONTRIBUTORS)
 
 License
 -------
